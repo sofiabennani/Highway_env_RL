@@ -1,0 +1,12 @@
+{
+  "exp_name": "exp_01",
+  "resume": false,
+  "evaluate": false,
+  "hidden": 16,
+  "generations": 150,
+  "sigma0": 0.5,
+  "popsize": null,
+  "rollouts": 5,
+  "vehicles_density": 1.0,
+  "workers": null
+}

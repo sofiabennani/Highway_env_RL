@@ -4,6 +4,9 @@ custom_env.py
 Defines CustomHighwayEnv — a subclass of HighwayEnv with a richer reward
 function — and registers it as "custom-highway-v0" with gymnasium.
 
+Also exports MLP and observation constants (OBS_DIM, N_ACTIONS) so that
+subprocesses only need to import this one file.
+
 All three experiments (CMA-ES, DQN, PPO) should import this file so they
 share an identical environment. Just do:
 
@@ -28,6 +31,49 @@ from gymnasium.envs.registration import register
 
 from highway_env import utils
 from highway_env.envs.highway_env import HighwayEnv
+
+
+# ---------------------------------------------------------------------------
+# Observation / action constants
+# ---------------------------------------------------------------------------
+
+OBS_VEHICLES = 15
+OBS_FEATURES = 5   # presence, x, y, vx, vy
+OBS_DIM      = OBS_VEHICLES * OBS_FEATURES  # 75
+N_ACTIONS    = 5
+
+
+# ---------------------------------------------------------------------------
+# Policy network — lives here so subprocesses only need to import custom_env
+# ---------------------------------------------------------------------------
+
+class MLP:
+    """
+    Two-layer MLP: obs → hidden (tanh) → logits → argmax action.
+    Weights are stored as a single flat numpy array for CMA-ES.
+    """
+
+    def __init__(self, obs_dim: int, hidden_dim: int, n_actions: int):
+        self.shapes = [
+            (obs_dim, hidden_dim),    # W1
+            (hidden_dim,),            # b1
+            (hidden_dim, n_actions),  # W2
+            (n_actions,),             # b2
+        ]
+        self.n_params = sum(int(np.prod(s)) for s in self.shapes)
+
+    def unpack(self, weights: np.ndarray):
+        params, idx = [], 0
+        for shape in self.shapes:
+            size = int(np.prod(shape))
+            params.append(weights[idx: idx + size].reshape(shape))
+            idx += size
+        return params
+
+    def forward(self, obs: np.ndarray, weights: np.ndarray) -> int:
+        W1, b1, W2, b2 = self.unpack(weights)
+        x = np.tanh(obs.flatten() @ W1 + b1)
+        return int(np.argmax(x @ W2 + b2))
 
 
 # ---------------------------------------------------------------------------
