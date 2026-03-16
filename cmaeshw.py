@@ -56,24 +56,29 @@ from custom_env import MLP, OBS_DIM, N_ACTIONS
 # Rollout (runs in a subprocess — all imports must be inside)
 # ---------------------------------------------------------------------------
 
-def rollout(args) -> float:
-    """Single episode. Called by Pool.map — must be a top-level function."""
+def rollout(args) -> tuple:
+    """Single episode. Returns (total_reward, crashed)."""
     weights, hidden_dim, vehicles_density, seed = args
 
     import gymnasium as gym
     import numpy as np
     from custom_env import MLP, OBS_DIM, N_ACTIONS  # also re-registers the env
 
+    # Override only vehicles_density — all other params come from default_config()
+    env = gym.make("custom-highway-v0", config={"vehicles_density": vehicles_density})
+    policy = MLP(OBS_DIM, hidden_dim, N_ACTIONS)
+
     obs, _ = env.reset(seed=seed)
     total, done, truncated = 0.0, False, False
+    info = {}
 
     while not (done or truncated):
         action = policy.forward(obs, weights)
-        obs, reward, done, truncated, _ = env.step(action)
+        obs, reward, done, truncated, info = env.step(action)
         total += reward
 
     env.close()
-    return total
+    return total, bool(info.get("crashed", False))
 
 
 def evaluate_weights(
@@ -83,13 +88,19 @@ def evaluate_weights(
     vehicles_density: float,
     pool: Pool,
     base_seed: int = 0,
-) -> float:
-    """Average reward over n_rollouts episodes, evaluated in parallel."""
+) -> tuple:
+    """
+    Average reward and crash rate over n_rollouts episodes.
+    Returns (mean_reward, crash_rate) where crash_rate is in [0, 1].
+    """
     args = [
         (weights, hidden_dim, vehicles_density, base_seed + i)
         for i in range(n_rollouts)
     ]
-    return float(np.mean(pool.map(rollout, args)))
+    results = pool.map(rollout, args)
+    rewards = [r for r, _ in results]
+    crashes = [c for _, c in results]
+    return float(np.mean(rewards)), float(np.mean(crashes))
 
 
 # ---------------------------------------------------------------------------
@@ -128,15 +139,15 @@ def init_log(directory: Path) -> Path:
     path = directory / "log.csv"
     with open(path, "w", newline="") as f:
         csv.writer(f).writerow(
-            ["generation", "mean_fitness", "best_fitness", "sigma", "elapsed_s"]
+            ["generation", "mean_fitness", "best_fitness", "sigma", "elapsed_s", "crash_rate"]
         )
     return path
 
 
-def append_log(path: Path, gen, mean_f, best_f, sigma, elapsed):
+def append_log(path: Path, gen, mean_f, best_f, sigma, elapsed, crash_rate=0.0):
     with open(path, "a", newline="") as f:
         csv.writer(f).writerow(
-            [gen, f"{mean_f:.4f}", f"{best_f:.4f}", f"{sigma:.6f}", f"{elapsed:.1f}"]
+            [gen, f"{mean_f:.4f}", f"{best_f:.4f}", f"{sigma:.6f}", f"{elapsed:.1f}", f"{crash_rate:.4f}"]
         )
 
 
@@ -193,7 +204,7 @@ def train(config: dict):
             t0        = time.time()
             solutions = es.ask()
 
-            fitnesses = [
+            fitnesses_and_crashes = [
                 evaluate_weights(
                     w,
                     hidden_dim,
@@ -205,11 +216,15 @@ def train(config: dict):
                 for w in solutions
             ]
 
+            fitnesses   = [f for f, _ in fitnesses_and_crashes]
+            crash_rates = [c for _, c in fitnesses_and_crashes]
+
             es.tell(solutions, [-f for f in fitnesses])  # CMA-ES minimises
 
-            gen_best_idx = int(np.argmax(fitnesses))
-            gen_best     = fitnesses[gen_best_idx]
-            mean_fitness = float(np.mean(fitnesses))
+            gen_best_idx  = int(np.argmax(fitnesses))
+            gen_best      = fitnesses[gen_best_idx]
+            mean_fitness  = float(np.mean(fitnesses))
+            mean_crashes  = float(np.mean(crash_rates))   # avg across population
 
             if gen_best > best_fitness:
                 best_fitness = gen_best
@@ -222,10 +237,11 @@ def train(config: dict):
                 f"mean: {mean_fitness:7.3f}  "
                 f"best: {gen_best:7.3f}  "
                 f"all-time: {best_fitness:7.3f}  "
+                f"crashes: {mean_crashes * 100:5.1f}%  "
                 f"σ: {es.sigma:.4f}  "
                 f"({time.time() - t0:.1f}s)"
             )
-            append_log(log_path, generation, mean_fitness, gen_best, es.sigma, elapsed)
+            append_log(log_path, generation, mean_fitness, gen_best, es.sigma, elapsed, mean_crashes)
 
             if generation % 10 == 0:
                 save_checkpoint(directory, es, best_weights, best_fitness)

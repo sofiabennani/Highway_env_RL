@@ -25,7 +25,7 @@ from pathlib import Path
 import gymnasium as gym
 import numpy as np
 
-import custom_env as custom_env  # noqa — registers "custom-highway-v0"
+import custom_env  # noqa — registers "custom-highway-v0"
 from custom_env import MLP, OBS_DIM, N_ACTIONS
 
 
@@ -88,8 +88,18 @@ def main(args):
         steps_list.append(steps)
         crashes.append(crashed)
 
-        status = "CRASH" if crashed else "ok"
-        print(f"  Episode {ep + 1:3d} | reward: {total:8.3f} | steps: {steps:4d} | {status}")
+        n_done       = ep + 1
+        crash_count  = sum(crashes)
+        crash_pct    = 100 * crash_count / n_done
+        status       = "💥 CRASH" if crashed else "✓"
+
+        print(
+            f"  Episode {n_done:3d}/{args.episodes}"
+            f" | reward: {total:8.3f}"
+            f" | steps: {steps:4d}"
+            f" | {status:<8}"
+            f" | crashes so far: {crash_count}/{n_done} ({crash_pct:.0f}%)"
+        )
 
         # Pause between episodes so the window doesn't flash
         if ep < args.episodes - 1:
@@ -98,13 +108,15 @@ def main(args):
     env.close()
 
     # Summary
-    rewards = np.array(rewards)
-    print(f"\n{'─' * 45}")
-    print(f"  Episodes   : {args.episodes}")
-    print(f"  Mean reward: {rewards.mean():.3f} ± {rewards.std():.3f}")
-    print(f"  Min / Max  : {rewards.min():.3f} / {rewards.max():.3f}")
-    print(f"  Crash rate : {sum(crashes)}/{args.episodes}")
-    print(f"{'─' * 45}\n")
+    rewards     = np.array(rewards)
+    crash_count = sum(crashes)
+    crash_pct   = 100 * crash_count / args.episodes
+    print(f"\n{'─' * 50}")
+    print(f"  Episodes    : {args.episodes}")
+    print(f"  Mean reward : {rewards.mean():.3f} ± {rewards.std():.3f}")
+    print(f"  Min / Max   : {rewards.min():.3f} / {rewards.max():.3f}")
+    print(f"  Crash rate  : {crash_count}/{args.episodes} ({crash_pct:.0f}%)")
+    print(f"{'─' * 50}\n")
 
 
 # ---------------------------------------------------------------------------

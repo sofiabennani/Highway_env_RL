@@ -87,6 +87,9 @@ class CustomHighwayEnv(HighwayEnv):
         config = super().default_config()
         config.update(
             {
+                # --- traffic ---
+                "vehicles_density": 1.0,
+
                 # --- observation ---
                 "observation": {
                     "type": "Kinematics",
@@ -104,7 +107,7 @@ class CustomHighwayEnv(HighwayEnv):
                 },
 
                 # --- episode ---
-                "duration": 250,              # steps
+                "duration": 50,              # steps
                 "simulation_frequency": 15,   # Hz
                 "policy_frequency": 2,        # Hz
 
