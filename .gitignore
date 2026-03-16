@@ -1,0 +1,23 @@
+# Virtual environment
+.venv/
+
+# IDE
+.vscode/
+
+# Downloaded packages / archives
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# TensorBoard logs (generated during training)
+runs/
+
+# Outputs
+*.png
+*.mp4
+*.gif
