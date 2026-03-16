@@ -128,6 +128,7 @@ class CustomHighwayEnv(HighwayEnv):
         super()._reset()
         self.prev_speed = self.vehicle.speed
         self.prev_acceleration = 0.0
+        self._last_reward_terms = {}
 
     def _reward(self, action: int) -> float:
         # --- collision ---
@@ -191,8 +192,21 @@ class CustomHighwayEnv(HighwayEnv):
         self.prev_acceleration = acceleration
 
         # Zero out everything if off-road
-        reward *= float(self.vehicle.on_road)
-        return float(reward)
+        on_road = float(self.vehicle.on_road)
+        self._last_reward_terms = {
+            "collision":    collision_term * on_road,
+            "speed":        speed_term * on_road,
+            "acceleration": acceleration_term * on_road,
+            "jerk":         jerk_term * on_road,
+            "lane_change":  lane_change_term * on_road,
+            "stable_speed": stable_speed_term * on_road,
+        }
+        return float(reward * on_road)
+
+    def _info(self, obs, action) -> dict:
+        info = super()._info(obs, action)
+        info["reward_terms"] = self._last_reward_terms
+        return info
 
     def _is_terminated(self) -> bool:
         return self.vehicle.crashed

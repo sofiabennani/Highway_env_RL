@@ -1,21 +1,36 @@
 """
 render_agent.py
 ===============
-Visualise a trained CMA-ES policy on custom-highway-v0.
+Render trained policies from either CMA-ES or NSGA-II experiments.
 
-Usage
------
-# Watch the best policy from exp_01 (5 episodes)
+CMA-ES usage
+------------
+# Best policy from a CMA-ES run
 python render_agent.py --exp-name exp_01
 
-# More episodes, slower speed
-python render_agent.py --exp-name exp_01 --episodes 10 --fps 15
-
-# Try a specific saved policy (e.g. final_policy.npz)
+# Specific saved file
 python render_agent.py --exp-name exp_01 --policy final_policy.npz
 
-# Random agent baseline for comparison
-python render_agent.py --random
+NSGA-II usage
+-------------
+# List all policies on the Pareto front (no render)
+python render_agent.py --exp-name night_run --nsga2 --list
+
+# Render a specific policy by index (from the list above)
+python render_agent.py --exp-name night_run --nsga2 --policy-index 3
+
+# Render the safest policy (lowest crash rate on the front)
+python render_agent.py --exp-name night_run --nsga2 --select safest
+
+# Render the fastest policy
+python render_agent.py --exp-name night_run --nsga2 --select fastest
+
+# Render the best compromise (closest to utopia point)
+python render_agent.py --exp-name night_run --nsga2 --select balanced
+
+Other
+-----
+python render_agent.py --random    # random agent baseline
 """
 
 import argparse
@@ -25,54 +40,106 @@ from pathlib import Path
 import gymnasium as gym
 import numpy as np
 
-import custom_env  # noqa — registers "custom-highway-v0"
+import custom_env  # noqa
 from custom_env import MLP, OBS_DIM, N_ACTIONS
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Loaders
 # ---------------------------------------------------------------------------
 
-def load_policy(exp_name: str, filename: str) -> np.ndarray:
+def load_cmaes_policy(exp_name: str, filename: str) -> np.ndarray:
     path = Path("results") / exp_name / filename
     if not path.exists():
         raise FileNotFoundError(f"No policy found at {path}")
     return np.load(path)["weights"]
 
 
-def run_episode(env, policy_fn, seed: int) -> tuple[float, int, bool]:
-    """Run one episode. Returns (total_reward, n_steps, crashed)."""
+def load_nsga2_front(exp_name: str):
+    directory  = Path("results") / exp_name
+    front_path = directory / "pareto_front.npz"
+    obj_path   = directory / "pareto_objectives.npy"
+    if not front_path.exists():
+        raise FileNotFoundError(
+            f"No Pareto front at {front_path}\n"
+            f"Run: python nsga2_highway.py --exp-name {exp_name}"
+        )
+    data         = np.load(front_path)
+    weights_list = [data[f"w_{i}"] for i in range(len(data.files))]
+    objectives   = np.load(obj_path)
+    return weights_list, objectives
+
+
+def select_policy(weights_list, objectives, mode: str, index: int = None):
+    """Returns (weights, label, obj_row)."""
+    if mode == "index":
+        if index is None or index >= len(weights_list):
+            raise ValueError(f"--policy-index must be in [0, {len(weights_list)-1}]")
+        i = index
+    elif mode == "safest":
+        i = int(np.argmax(objectives[:, 1]))
+    elif mode == "fastest":
+        i = int(np.argmax(objectives[:, 0]))
+    elif mode == "balanced":
+        utopia  = objectives.max(axis=0)
+        obj_min = objectives.min(axis=0)
+        rng     = np.where(objectives.max(axis=0) - obj_min > 0,
+                           objectives.max(axis=0) - obj_min, 1.0)
+        norm    = (objectives - obj_min) / rng
+        norm_u  = (utopia - obj_min) / rng
+        i       = int(np.argmin(np.linalg.norm(norm - norm_u, axis=1)))
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+
+    obj   = objectives[i]
+    label = f"{mode} (#{i})  speed={obj[0]:.1f}  safety={obj[1]:.1f}  smooth={obj[2]:.1f}"
+    return weights_list[i], label, obj
+
+
+# ---------------------------------------------------------------------------
+# Episode runner
+# ---------------------------------------------------------------------------
+
+def run_episode(env, policy_fn, seed: int):
     obs, _ = env.reset(seed=seed)
     total, steps = 0.0, 0
     done = truncated = False
-
+    info = {}
     while not (done or truncated):
         action = policy_fn(obs)
         obs, reward, done, truncated, info = env.step(action)
         total += reward
         steps += 1
-
-    crashed = info.get("crashed", False)
-    return total, steps, crashed
+    return total, steps, bool(info.get("crashed", False))
 
 
 # ---------------------------------------------------------------------------
-# Main
+# List Pareto front
 # ---------------------------------------------------------------------------
 
-def main(args):
-    # Build policy function
-    if args.random:
-        label = "Random agent"
-        policy_fn = lambda obs: np.random.randint(N_ACTIONS)
-    else:
-        weights = load_policy(args.exp_name, args.policy)
-        mlp     = MLP(OBS_DIM, args.hidden, N_ACTIONS)
-        policy_fn = lambda obs: mlp.forward(obs, weights)
-        label = f"CMA-ES — {args.exp_name}/{args.policy}"
+def list_front(exp_name: str):
+    weights_list, objectives = load_nsga2_front(exp_name)
+    n = len(weights_list)
+    print(f"\nPareto front — {exp_name}  ({n} policies)\n")
+    print(f"  {'#':>4}  {'speed':>8}  {'safety':>8}  {'smooth':>8}  profile")
+    print("  " + "─" * 58)
+    for i in np.argsort(-objectives[:, 1]):  # sorted by safety
+        obj = objectives[i]
+        safe  = "safe"   if obj[1] >= -1  else ("moderate" if obj[1] >= -5 else "risky")
+        fast  = "fast"   if obj[0] > 200  else ("medium"   if obj[0] > 100 else "slow")
+        print(f"  {i:4d}  {obj[0]:8.2f}  {obj[1]:8.2f}  {obj[2]:8.2f}  {safe} + {fast}")
+    print()
+    print("  safety: 0 = no crash ever, -10 = crashed every episode")
+    print("  Use --policy-index N  or  --select safest/fastest/balanced\n")
 
+
+# ---------------------------------------------------------------------------
+# Render loop
+# ---------------------------------------------------------------------------
+
+def render(policy_fn, label, args):
     print(f"\n{label}")
-    print(f"Running {args.episodes} episode(s) at ~{args.fps} fps\n")
+    print(f"Running {args.episodes} episode(s)\n")
 
     env = gym.make(
         "custom-highway-v0",
@@ -80,43 +147,68 @@ def main(args):
         render_mode="human",
     )
 
-    rewards, steps_list, crashes = [], [], []
+    rewards, crashes = [], []
 
     for ep in range(args.episodes):
         total, steps, crashed = run_episode(env, policy_fn, seed=args.seed + ep)
         rewards.append(total)
-        steps_list.append(steps)
         crashes.append(crashed)
 
-        n_done       = ep + 1
-        crash_count  = sum(crashes)
-        crash_pct    = 100 * crash_count / n_done
-        status       = "💥 CRASH" if crashed else "✓"
+        n_done      = ep + 1
+        crash_count = sum(crashes)
+        crash_pct   = 100 * crash_count / n_done
+        status      = "CRASH" if crashed else "ok"
 
         print(
             f"  Episode {n_done:3d}/{args.episodes}"
             f" | reward: {total:8.3f}"
             f" | steps: {steps:4d}"
-            f" | {status:<8}"
-            f" | crashes so far: {crash_count}/{n_done} ({crash_pct:.0f}%)"
+            f" | {status:<6}"
+            f" | crashes: {crash_count}/{n_done} ({crash_pct:.0f}%)"
         )
 
-        # Pause between episodes so the window doesn't flash
         if ep < args.episodes - 1:
             time.sleep(1.0)
 
     env.close()
 
-    # Summary
     rewards     = np.array(rewards)
     crash_count = sum(crashes)
-    crash_pct   = 100 * crash_count / args.episodes
     print(f"\n{'─' * 50}")
     print(f"  Episodes    : {args.episodes}")
     print(f"  Mean reward : {rewards.mean():.3f} ± {rewards.std():.3f}")
     print(f"  Min / Max   : {rewards.min():.3f} / {rewards.max():.3f}")
-    print(f"  Crash rate  : {crash_count}/{args.episodes} ({crash_pct:.0f}%)")
+    print(f"  Crash rate  : {crash_count}/{args.episodes} ({100*crash_count/args.episodes:.0f}%)")
     print(f"{'─' * 50}\n")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main(args):
+    mlp = MLP(OBS_DIM, args.hidden, N_ACTIONS)
+
+    if args.nsga2:
+        if args.list:
+            list_front(args.exp_name)
+            return
+        weights_list, objectives = load_nsga2_front(args.exp_name)
+        mode      = "index" if args.policy_index is not None else args.select
+        weights, label, _ = select_policy(weights_list, objectives, mode, args.policy_index)
+        label     = f"NSGA-II — {args.exp_name} — {label}"
+        policy_fn = lambda obs: mlp.forward(obs, weights)
+
+    elif args.random:
+        label     = "Random agent"
+        policy_fn = lambda obs: np.random.randint(N_ACTIONS)
+
+    else:
+        weights   = load_cmaes_policy(args.exp_name, args.policy)
+        policy_fn = lambda obs: mlp.forward(obs, weights)
+        label     = f"CMA-ES — {args.exp_name}/{args.policy}"
+
+    render(policy_fn, label, args)
 
 
 # ---------------------------------------------------------------------------
@@ -124,27 +216,28 @@ def main(args):
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Render a trained CMA-ES policy")
+    p = argparse.ArgumentParser(description="Render CMA-ES or NSGA-II policies")
 
-    p.add_argument("--exp-name",         type=str,   default="exp_01",
-                   help="Experiment folder under results/ (default: exp_01)")
-    p.add_argument("--policy",           type=str,   default="best_policy.npz",
-                   help="Policy file to load (default: best_policy.npz)")
-    p.add_argument("--hidden",           type=int,   default=16,
-                   help="Hidden layer size — must match training (default: 16)")
+    p.add_argument("--exp-name",         type=str,   default="exp_01")
+    p.add_argument("--hidden",           type=int,   default=16)
+    p.add_argument("--episodes",         type=int,   default=5)
+    p.add_argument("--seed",             type=int,   default=0)
+    p.add_argument("--vehicles-density", type=float, default=1.0)
+    p.add_argument("--random",           action="store_true")
 
-    p.add_argument("--episodes",         type=int,   default=5,
-                   help="Number of episodes to render (default: 5)")
-    p.add_argument("--fps",              type=int,   default=30,
-                   help="Target render FPS — cosmetic only (default: 30)")
-    p.add_argument("--seed",             type=int,   default=0,
-                   help="Base random seed; each episode uses seed+i (default: 0)")
+    # CMA-ES
+    p.add_argument("--policy",           type=str,   default="best_policy.npz")
 
-    p.add_argument("--vehicles-density", type=float, default=1.0,
-                   help="Traffic density (default: 1.0)")
-
-    p.add_argument("--random",           action="store_true",
-                   help="Run a random agent instead of a trained policy")
+    # NSGA-II
+    p.add_argument("--nsga2",            action="store_true",
+                   help="Load from NSGA-II Pareto front")
+    p.add_argument("--list",             action="store_true",
+                   help="[NSGA-II] Print the Pareto front and exit")
+    p.add_argument("--policy-index",     type=int,   default=None,
+                   help="[NSGA-II] Index of policy to render")
+    p.add_argument("--select",           type=str,   default="balanced",
+                   choices=["safest", "fastest", "balanced"],
+                   help="[NSGA-II] Auto-select a policy (default: balanced)")
 
     return p.parse_args()
 

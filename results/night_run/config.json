@@ -1,0 +1,12 @@
+{
+  "exp_name": "night_run",
+  "evaluate": false,
+  "hidden": 16,
+  "hours": 7.0,
+  "generations": null,
+  "popsize": 50,
+  "rollouts": 5,
+  "seed": 42,
+  "vehicles_density": 1.0,
+  "workers": null
+}
