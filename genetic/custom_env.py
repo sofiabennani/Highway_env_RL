@@ -221,5 +221,5 @@ class CustomHighwayEnv(HighwayEnv):
 
 register(
     id="custom-highway-v0",
-    entry_point="custom_env:CustomHighwayEnv",
+    entry_point="genetic.custom_env:CustomHighwayEnv",
 )

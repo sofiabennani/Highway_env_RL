@@ -20,12 +20,16 @@ python nsga2_highway.py --exp-name night_run --evaluate  # evaluate saved front
 
 Output
 ------
-results/<exp_name>/
+genetic/results/<exp_name>/
   config.json            full config for reproducibility
   pareto_front.npz       weights of all non-dominated policies found
   pareto_objectives.npy  objective vectors for each policy on the front
   log.csv                per-generation stats
-  checkpoint.npz         full population + objectives (resume not yet supported)
+  population_checkpoint.npz  full population + objectives (used by --resume)
+
+Resume
+------
+python nsga2_highway.py --exp-name night_run_v2 --resume --hours 5
 """
 
 import argparse
@@ -43,13 +47,26 @@ from pymoo.core.callback import Callback
 from pymoo.operators.crossover.sbx import SBX
 from pymoo.operators.mutation.gauss import GM
 from pymoo.operators.sampling.rnd import FloatRandomSampling
+from pymoo.core.sampling import Sampling
 from pymoo.optimize import minimize
 from pymoo.termination.max_time import TimeBasedTermination
 from pymoo.termination.max_gen import MaximumGenerationTermination
 
 import gymnasium as gym
-import custom_env  # noqa — registers "custom-highway-v0"
-from custom_env import MLP, OBS_DIM, N_ACTIONS
+import genetic.custom_env as custom_env  # noqa — registers "custom-highway-v0"
+from genetic.custom_env import MLP, OBS_DIM, N_ACTIONS
+
+
+def fmt_duration(seconds: float) -> str:
+    """Format a duration as e.g. '2h04m07s', '5m30s', or '42s'."""
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m{sec:02d}s"
+    elif m:
+        return f"{m}m{sec:02d}s"
+    return f"{sec}s"
 
 # ---------------------------------------------------------------------------
 # Objectives
@@ -62,6 +79,20 @@ from custom_env import MLP, OBS_DIM, N_ACTIONS
 #   F[2] = -mean(smoothness_term)     smoothness = acceleration + jerk + stable_speed
 
 SMOOTHNESS_KEYS = ["acceleration", "jerk", "stable_speed"]
+
+
+# ---------------------------------------------------------------------------
+# Resume helper — inject a saved population as NSGA-II seed
+# ---------------------------------------------------------------------------
+
+class _CheckpointSampling(Sampling):
+    """Seeds NSGA-II from a saved population array."""
+    def __init__(self, X_init):
+        super().__init__()
+        self.X_init = X_init
+
+    def _do(self, problem, n_samples, **kwargs):
+        return self.X_init
 
 # ---------------------------------------------------------------------------
 # Rollout (subprocess-safe — top-level function)
@@ -76,7 +107,7 @@ def rollout(args) -> tuple:
 
     import gymnasium as gym
     import numpy as np
-    from custom_env import MLP, OBS_DIM, N_ACTIONS
+    from genetic.custom_env import MLP, OBS_DIM, N_ACTIONS
 
     env = gym.make("custom-highway-v0", config={"vehicles_density": vehicles_density})
     policy = MLP(OBS_DIM, hidden_dim, N_ACTIONS)
@@ -111,7 +142,7 @@ def evaluate_individual(args) -> tuple:
 
     import gymnasium as gym
     import numpy as np
-    from custom_env import MLP, OBS_DIM, N_ACTIONS
+    from genetic.custom_env import MLP, OBS_DIM, N_ACTIONS
 
     rollout_args = [
         (weights, hidden_dim, vehicles_density, base_seed + i)
@@ -190,11 +221,14 @@ class HighwayProblem(Problem):
 class LogCallback(Callback):
     """Called after each generation — logs stats and prints to console."""
 
-    def __init__(self, log_path: Path, t_start: float):
+    def __init__(self, log_path: Path, t_start: float, exp_dir: Path, hidden_dim: int,
+                 gen_offset: int = 0):
         super().__init__()
-        self.log_path = log_path
-        self.t_start  = t_start
-        self.gen      = 0
+        self.log_path   = log_path
+        self.t_start    = t_start
+        self.exp_dir    = exp_dir
+        self.hidden_dim = hidden_dim
+        self.gen        = gen_offset
 
     def notify(self, algorithm):
         self.gen += 1
@@ -203,11 +237,12 @@ class LogCallback(Callback):
         algorithm.problem.generation_counter[0] = self.gen
 
         F           = algorithm.pop.get("F")
+        X           = algorithm.pop.get("X")
         crash_rates = algorithm.pop.get("crash_rates")
 
         # Pareto front of current population
         from pymoo.indicators.hv import HV
-        ref_point = np.array([50.0, 10.5, 50.0])  # slightly worse than worst possible
+        ref_point = np.array([50.0, 10.5, 50.0])
         try:
             hv_val = HV(ref_point=ref_point)(F)
         except Exception:
@@ -219,8 +254,8 @@ class LogCallback(Callback):
         mean_crash = float(np.mean(crash_rates)) if crash_rates is not None else float("nan")
         elapsed    = time.time() - self.t_start
 
-        # Count non-dominated individuals in current population
-        n_pareto = int(np.sum(algorithm.pop.get("rank") == 0))
+        ranks    = algorithm.pop.get("rank")
+        n_pareto = int(np.sum(ranks == 0))
 
         print(
             f"Gen {self.gen:4d}  "
@@ -229,8 +264,8 @@ class LogCallback(Callback):
             f"safety: {-mean_f2:6.3f}  "
             f"smooth: {-mean_f3:6.3f}  "
             f"crashes: {mean_crash*100:5.1f}%  "
-            f"pareto_size: {n_pareto:3d}  "
-            f"({elapsed/3600:.2f}h)"
+            f"pareto: {n_pareto:3d}  "
+            f"[{fmt_duration(elapsed)}]"
         )
 
         with open(self.log_path, "a", newline="") as f:
@@ -245,39 +280,84 @@ class LogCallback(Callback):
                 f"{elapsed:.1f}",
             ])
 
+        # --- Save checkpoint every 5 generations ---
+        if self.gen % 5 == 0 and X is not None:
+            pareto_mask   = ranks == 0
+            pareto_X      = X[pareto_mask]
+            pareto_F_raw  = F[pareto_mask]
+            # Convert back to readable objectives (higher = better)
+            objectives = np.column_stack([
+                -pareto_F_raw[:, 0],
+                -pareto_F_raw[:, 1],
+                -pareto_F_raw[:, 2],
+            ])
+            save_front(self.exp_dir, list(pareto_X), objectives, self.hidden_dim)
+            # Also save full population for potential resume
+            np.savez(
+                self.exp_dir / "population_checkpoint.npz",
+                X=X, F=F, ranks=ranks,
+                gen=np.array(self.gen),
+            )
+            print(f"  Checkpoint saved (gen {self.gen}, {len(pareto_X)} pareto policies)")
+
 
 # ---------------------------------------------------------------------------
 # I/O helpers
 # ---------------------------------------------------------------------------
 
 def make_exp_dir(exp_name: str) -> Path:
-    path = Path("results") / exp_name
+    path = Path(__file__).parent / "results" / exp_name
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
-def save_front(directory: Path, weights_list, objectives):
-    np.savez(directory / "pareto_front.npz",
-             **{f"w_{i}": w for i, w in enumerate(weights_list)})
+def save_front(directory: Path, weights_list, objectives, hidden_dim: int):
+    np.savez(
+        directory / "pareto_front.npz",
+        _hidden_dim = np.array(hidden_dim),   # architecture metadata
+        _obs_dim    = np.array(OBS_DIM),
+        _n_actions  = np.array(N_ACTIONS),
+        **{f"w_{i}": w for i, w in enumerate(weights_list)},
+    )
     np.save(directory / "pareto_objectives.npy", objectives)
-    print(f"  Saved Pareto front: {len(weights_list)} policies")
+    print(f"  Saved Pareto front: {len(weights_list)} policies  (hidden={hidden_dim})")
 
 
 def load_front(directory: Path):
-    data = np.load(directory / "pareto_front.npz")
-    weights_list = [data[f"w_{i}"] for i in range(len(data.files))]
+    data         = np.load(directory / "pareto_front.npz")
+    # Weights keys are everything except the metadata keys (prefixed with _)
+    weight_keys  = sorted(k for k in data.files if not k.startswith("_"))
+    weights_list = [data[k] for k in weight_keys]
     objectives   = np.load(directory / "pareto_objectives.npy")
-    return weights_list, objectives
+    # Return architecture alongside weights
+    hidden_dim   = int(data["_hidden_dim"]) if "_hidden_dim" in data.files else None
+    return weights_list, objectives, hidden_dim
 
 
-def init_log(directory: Path) -> Path:
+def _truncate_log(log_path: Path, keep_up_to_gen: int) -> None:
+    """Remove all CSV rows with generation > keep_up_to_gen (in-place)."""
+    if not log_path.exists():
+        return
+    with open(log_path, "r", newline="") as f:
+        rows = list(csv.reader(f))
+    # rows[0] is header; keep rows whose first column <= keep_up_to_gen
+    kept = [rows[0]] + [r for r in rows[1:] if r and int(r[0]) <= keep_up_to_gen]
+    removed = len(rows) - len(kept)
+    with open(log_path, "w", newline="") as f:
+        csv.writer(f).writerows(kept)
+    if removed:
+        print(f"  Truncated log: removed {removed} row(s) after gen {keep_up_to_gen}")
+
+
+def init_log(directory: Path, append: bool = False) -> Path:
     path = directory / "log.csv"
-    with open(path, "w", newline="") as f:
-        csv.writer(f).writerow([
-            "generation", "hypervolume",
-            "mean_speed", "mean_safety", "mean_smoothness",
-            "crash_rate", "pareto_size", "elapsed_s"
-        ])
+    if not append:
+        with open(path, "w", newline="") as f:
+            csv.writer(f).writerow([
+                "generation", "hypervolume",
+                "mean_speed", "mean_safety", "mean_smoothness",
+                "crash_rate", "pareto_size", "elapsed_s"
+            ])
     return path
 
 
@@ -286,15 +366,36 @@ def init_log(directory: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 def train(config: dict):
+    resuming  = config.get("resume", False)
     directory = make_exp_dir(config["exp_name"])
-
-    with open(directory / "config.json", "w") as f:
-        json.dump(config, f, indent=2)
 
     hidden_dim = config["hidden"]
     n_params   = MLP(OBS_DIM, hidden_dim, N_ACTIONS).n_params
     n_workers  = config["workers"] or max(1, os.cpu_count() - 1)
     popsize    = config["popsize"]
+
+    # --- Resume: load checkpoint ---
+    gen_offset = 0
+    if resuming:
+        ckpt_path = directory / "population_checkpoint.npz"
+        if not ckpt_path.exists():
+            raise FileNotFoundError(
+                f"No checkpoint found at {ckpt_path}\n"
+                "Run without --resume to start from scratch."
+            )
+        ckpt       = np.load(ckpt_path)
+        X_init     = ckpt["X"]
+        gen_offset = int(ckpt["gen"])
+        sampling   = _CheckpointSampling(X_init)
+        log_path   = init_log(directory, append=True)
+        # Truncate log to gen_offset so resumed entries don't duplicate
+        _truncate_log(log_path, gen_offset)
+        print(f"\nResuming from generation {gen_offset}  ({len(X_init)} individuals)")
+    else:
+        sampling = FloatRandomSampling()
+        log_path = init_log(directory)
+        with open(directory / "config.json", "w") as f:
+            json.dump(config, f, indent=2)
 
     print(f"\nNSGA-II — custom-highway-v0")
     print(f"Policy: {OBS_DIM} → {hidden_dim} → {N_ACTIONS}  ({n_params} params)")
@@ -306,7 +407,9 @@ def train(config: dict):
         print(f"Budget: {config['generations']} generations")
     print()
 
-    generation_counter = [0]
+    # On resume, start counter at gen_offset-1 so the initial re-evaluation
+    # uses the same seeds as the original last generation (seed = counter*10000).
+    generation_counter = [max(0, gen_offset - 1) if resuming else gen_offset]
 
     problem = HighwayProblem(
         hidden_dim        = hidden_dim,
@@ -318,9 +421,9 @@ def train(config: dict):
 
     algorithm = NSGA2(
         pop_size   = popsize,
-        sampling   = FloatRandomSampling(),
-        crossover  = SBX(prob=0.9, eta=15),   # SBX: good for continuous weights
-        mutation   = GM(prob=1/n_params, sigma=0.1),  # Gaussian mutation
+        sampling   = sampling,
+        crossover  = SBX(prob=0.9, eta=15),
+        mutation   = GM(prob=1/n_params, sigma=0.1),
         eliminate_duplicates=True,
     )
 
@@ -331,8 +434,7 @@ def train(config: dict):
         termination = MaximumGenerationTermination(config["generations"])
 
     t_start  = time.time()
-    log_path = init_log(directory)
-    callback = LogCallback(log_path, t_start)
+    callback = LogCallback(log_path, t_start, directory, hidden_dim, gen_offset=gen_offset)
 
     result = minimize(
         problem,
@@ -355,10 +457,10 @@ def train(config: dict):
         -pareto_F[:, 2],   # smoothness (higher = better)
     ])
 
-    save_front(directory, weights_list, objectives_readable)
+    save_front(directory, weights_list, objectives_readable, hidden_dim)
 
     elapsed = time.time() - t_start
-    print(f"\nDone in {elapsed/3600:.2f}h  |  Pareto front: {len(weights_list)} policies")
+    print(f"\nDone in {fmt_duration(time.time() - t_start)}  |  Pareto front: {len(weights_list)} policies")
     print(f"Results in: {directory}/")
 
     # Print front summary
@@ -421,6 +523,8 @@ def parse_args():
                    help="Experiment name (default: nsga2_01)")
     p.add_argument("--evaluate",         action="store_true",
                    help="Evaluate saved Pareto front instead of training")
+    p.add_argument("--resume",           action="store_true",
+                   help="Resume from population_checkpoint.npz in the exp directory")
 
     p.add_argument("--hidden",           type=int,   default=16,
                    help="Hidden layer size (default: 16)")

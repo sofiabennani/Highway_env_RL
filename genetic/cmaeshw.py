@@ -48,8 +48,8 @@ import cma
 import gymnasium as gym
 import numpy as np
 
-import custom_env  # noqa: F401 — registers "custom-highway-v0"
-from custom_env import MLP, OBS_DIM, N_ACTIONS
+import genetic.custom_env as custom_env  # noqa: F401 — registers "custom-highway-v0"
+from genetic.custom_env import MLP, OBS_DIM, N_ACTIONS
 
 
 # ---------------------------------------------------------------------------
@@ -57,14 +57,13 @@ from custom_env import MLP, OBS_DIM, N_ACTIONS
 # ---------------------------------------------------------------------------
 
 def rollout(args) -> tuple:
-    """Single episode. Returns (total_reward, crashed)."""
+    """Single episode. Returns (total_reward, crashed, reward_terms_dict)."""
     weights, hidden_dim, vehicles_density, seed = args
 
     import gymnasium as gym
     import numpy as np
-    from custom_env import MLP, OBS_DIM, N_ACTIONS  # also re-registers the env
+    from genetic.custom_env import MLP, OBS_DIM, N_ACTIONS  # also re-registers the env
 
-    # Override only vehicles_density — all other params come from default_config()
     env = gym.make("custom-highway-v0", config={"vehicles_density": vehicles_density})
     policy = MLP(OBS_DIM, hidden_dim, N_ACTIONS)
 
@@ -72,13 +71,21 @@ def rollout(args) -> tuple:
     total, done, truncated = 0.0, False, False
     info = {}
 
+    # Accumulate reward terms over the episode
+    term_sums = {
+        "collision": 0.0, "speed": 0.0, "acceleration": 0.0,
+        "jerk": 0.0, "lane_change": 0.0, "action_accel": 0.0, "stable_speed": 0.0,
+    }
+
     while not (done or truncated):
         action = policy.forward(obs, weights)
         obs, reward, done, truncated, info = env.step(action)
         total += reward
+        for k, v in info.get("reward_terms", {}).items():
+            term_sums[k] = term_sums.get(k, 0.0) + v
 
     env.close()
-    return total, bool(info.get("crashed", False))
+    return total, bool(info.get("crashed", False)), term_sums
 
 
 def evaluate_weights(
@@ -90,17 +97,23 @@ def evaluate_weights(
     base_seed: int = 0,
 ) -> tuple:
     """
-    Average reward and crash rate over n_rollouts episodes.
-    Returns (mean_reward, crash_rate) where crash_rate is in [0, 1].
+    Returns (mean_reward, crash_rate, mean_reward_terms).
+    mean_reward_terms is a dict with per-term episode averages.
     """
     args = [
         (weights, hidden_dim, vehicles_density, base_seed + i)
         for i in range(n_rollouts)
     ]
     results = pool.map(rollout, args)
-    rewards = [r for r, _ in results]
-    crashes = [c for _, c in results]
-    return float(np.mean(rewards)), float(np.mean(crashes))
+    rewards  = [r for r, _, _ in results]
+    crashes  = [c for _, c, _ in results]
+    all_terms = [t for _, _, t in results]
+
+    mean_terms = {
+        k: float(np.mean([t[k] for t in all_terms]))
+        for k in all_terms[0]
+    }
+    return float(np.mean(rewards)), float(np.mean(crashes)), mean_terms
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +121,7 @@ def evaluate_weights(
 # ---------------------------------------------------------------------------
 
 def exp_dir(exp_name: str) -> Path:
-    path = Path("results") / exp_name
+    path = Path(__file__).parent / "results" / exp_name
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -135,19 +148,37 @@ def load_checkpoint(directory: Path):
     return d["es"], d["best_weights"], d["best_fitness"]
 
 
+TERM_KEYS = ["collision", "speed", "acceleration", "jerk", "lane_change", "action_accel", "stable_speed"]
+
+
+def fmt_duration(seconds: float) -> str:
+    """Format a duration as e.g. '2h04m07s', '5m30s', or '42s'."""
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m{sec:02d}s"
+    elif m:
+        return f"{m}m{sec:02d}s"
+    return f"{sec}s"
+
+
 def init_log(directory: Path) -> Path:
     path = directory / "log.csv"
     with open(path, "w", newline="") as f:
         csv.writer(f).writerow(
             ["generation", "mean_fitness", "best_fitness", "sigma", "elapsed_s", "crash_rate"]
+            + TERM_KEYS
         )
     return path
 
 
-def append_log(path: Path, gen, mean_f, best_f, sigma, elapsed, crash_rate=0.0):
+def append_log(path: Path, gen, mean_f, best_f, sigma, elapsed, crash_rate=0.0, terms=None):
+    terms = terms or {}
     with open(path, "a", newline="") as f:
         csv.writer(f).writerow(
             [gen, f"{mean_f:.4f}", f"{best_f:.4f}", f"{sigma:.6f}", f"{elapsed:.1f}", f"{crash_rate:.4f}"]
+            + [f"{terms.get(k, 0.0):.4f}" for k in TERM_KEYS]
         )
 
 
@@ -216,15 +247,22 @@ def train(config: dict):
                 for w in solutions
             ]
 
-            fitnesses   = [f for f, _ in fitnesses_and_crashes]
-            crash_rates = [c for _, c in fitnesses_and_crashes]
+            fitnesses    = [f for f, _, _ in fitnesses_and_crashes]
+            crash_rates  = [c for _, c, _ in fitnesses_and_crashes]
+            all_terms    = [t for _, _, t in fitnesses_and_crashes]
+
+            # Average reward terms across the whole population
+            mean_terms = {
+                k: float(np.mean([t[k] for t in all_terms]))
+                for k in TERM_KEYS
+            }
 
             es.tell(solutions, [-f for f in fitnesses])  # CMA-ES minimises
 
             gen_best_idx  = int(np.argmax(fitnesses))
             gen_best      = fitnesses[gen_best_idx]
             mean_fitness  = float(np.mean(fitnesses))
-            mean_crashes  = float(np.mean(crash_rates))   # avg across population
+            mean_crashes  = float(np.mean(crash_rates))
 
             if gen_best > best_fitness:
                 best_fitness = gen_best
@@ -232,6 +270,7 @@ def train(config: dict):
                 save_policy(directory, best_weights, "best_policy.npz")
 
             elapsed = time.time() - t_start
+            gen_time = time.time() - t0
             print(
                 f"Gen {generation:4d}/{config['generations']}  "
                 f"mean: {mean_fitness:7.3f}  "
@@ -239,9 +278,13 @@ def train(config: dict):
                 f"all-time: {best_fitness:7.3f}  "
                 f"crashes: {mean_crashes * 100:5.1f}%  "
                 f"σ: {es.sigma:.4f}  "
-                f"({time.time() - t0:.1f}s)"
+                f"[{fmt_duration(gen_time)} | total {fmt_duration(elapsed)}]"
             )
-            append_log(log_path, generation, mean_fitness, gen_best, es.sigma, elapsed, mean_crashes)
+            # Compact per-term summary on a second line
+            terms_str = "  ".join(f"{k[:4]}:{mean_terms[k]:+.2f}" for k in TERM_KEYS)
+            print(f"             terms | {terms_str}")
+
+            append_log(log_path, generation, mean_fitness, gen_best, es.sigma, elapsed, mean_crashes, mean_terms)
 
             if generation % 10 == 0:
                 save_checkpoint(directory, es, best_weights, best_fitness)

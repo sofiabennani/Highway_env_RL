@@ -40,8 +40,8 @@ from pathlib import Path
 import gymnasium as gym
 import numpy as np
 
-import custom_env  # noqa
-from custom_env import MLP, OBS_DIM, N_ACTIONS
+import genetic.custom_env as custom_env  # noqa
+from genetic.custom_env import MLP, OBS_DIM, N_ACTIONS
 
 
 # ---------------------------------------------------------------------------
@@ -49,25 +49,33 @@ from custom_env import MLP, OBS_DIM, N_ACTIONS
 # ---------------------------------------------------------------------------
 
 def load_cmaes_policy(exp_name: str, filename: str) -> np.ndarray:
-    path = Path("results") / exp_name / filename
+    path = Path(__file__).parent / "results" / exp_name / filename
     if not path.exists():
         raise FileNotFoundError(f"No policy found at {path}")
     return np.load(path)["weights"]
 
 
 def load_nsga2_front(exp_name: str):
-    directory  = Path("results") / exp_name
+    """
+    Returns (weights_list, objectives, hidden_dim) where hidden_dim may be
+    None for old saves that didn't store architecture metadata.
+    """
+    directory  = Path(__file__).parent / "results" / exp_name
     front_path = directory / "pareto_front.npz"
     obj_path   = directory / "pareto_objectives.npy"
+
     if not front_path.exists():
         raise FileNotFoundError(
             f"No Pareto front at {front_path}\n"
             f"Run: python nsga2_highway.py --exp-name {exp_name}"
         )
+
     data         = np.load(front_path)
-    weights_list = [data[f"w_{i}"] for i in range(len(data.files))]
+    weight_keys  = sorted(k for k in data.files if not k.startswith("_"))
+    weights_list = [data[k] for k in weight_keys]
     objectives   = np.load(obj_path)
-    return weights_list, objectives
+    hidden_dim   = int(data["_hidden_dim"]) if "_hidden_dim" in data.files else None
+    return weights_list, objectives, hidden_dim
 
 
 def select_policy(weights_list, objectives, mode: str, index: int = None):
@@ -118,15 +126,16 @@ def run_episode(env, policy_fn, seed: int):
 # ---------------------------------------------------------------------------
 
 def list_front(exp_name: str):
-    weights_list, objectives = load_nsga2_front(exp_name)
-    n = len(weights_list)
-    print(f"\nPareto front — {exp_name}  ({n} policies)\n")
+    weights_list, objectives, hidden_dim = load_nsga2_front(exp_name)
+    n    = len(weights_list)
+    arch = f"hidden={hidden_dim}" if hidden_dim is not None else "hidden=unknown"
+    print(f"\nPareto front — {exp_name}  ({n} policies, {arch})\n")
     print(f"  {'#':>4}  {'speed':>8}  {'safety':>8}  {'smooth':>8}  profile")
     print("  " + "─" * 58)
-    for i in np.argsort(-objectives[:, 1]):  # sorted by safety
-        obj = objectives[i]
-        safe  = "safe"   if obj[1] >= -1  else ("moderate" if obj[1] >= -5 else "risky")
-        fast  = "fast"   if obj[0] > 200  else ("medium"   if obj[0] > 100 else "slow")
+    for i in np.argsort(-objectives[:, 1]):
+        obj  = objectives[i]
+        safe = "safe"   if obj[1] >= -1  else ("moderate" if obj[1] >= -5 else "risky")
+        fast = "fast"   if obj[0] > 200  else ("medium"   if obj[0] > 100 else "slow")
         print(f"  {i:4d}  {obj[0]:8.2f}  {obj[1]:8.2f}  {obj[2]:8.2f}  {safe} + {fast}")
     print()
     print("  safety: 0 = no crash ever, -10 = crashed every episode")
@@ -187,13 +196,19 @@ def render(policy_fn, label, args):
 # ---------------------------------------------------------------------------
 
 def main(args):
-    mlp = MLP(OBS_DIM, args.hidden, N_ACTIONS)
-
     if args.nsga2:
         if args.list:
             list_front(args.exp_name)
             return
-        weights_list, objectives = load_nsga2_front(args.exp_name)
+
+        weights_list, objectives, saved_hidden = load_nsga2_front(args.exp_name)
+
+        # Use architecture from the saved file — never trust --hidden for NSGA-II
+        hidden_dim = saved_hidden if saved_hidden is not None else args.hidden
+        if saved_hidden is not None and saved_hidden != args.hidden:
+            print(f"  Note: using hidden={hidden_dim} from saved file (not --hidden={args.hidden})")
+
+        mlp       = MLP(OBS_DIM, hidden_dim, N_ACTIONS)
         mode      = "index" if args.policy_index is not None else args.select
         weights, label, _ = select_policy(weights_list, objectives, mode, args.policy_index)
         label     = f"NSGA-II — {args.exp_name} — {label}"
@@ -204,6 +219,8 @@ def main(args):
         policy_fn = lambda obs: np.random.randint(N_ACTIONS)
 
     else:
+        # CMA-ES — architecture comes from --hidden (stored in config.json)
+        mlp       = MLP(OBS_DIM, args.hidden, N_ACTIONS)
         weights   = load_cmaes_policy(args.exp_name, args.policy)
         policy_fn = lambda obs: mlp.forward(obs, weights)
         label     = f"CMA-ES — {args.exp_name}/{args.policy}"
